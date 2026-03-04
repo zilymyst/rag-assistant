@@ -1,16 +1,31 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from pypdf import PdfReader
-import chromadb
-import httpx  # 替换requests为异步客户端
+# ====================== 1. 标准库导入（Python自带） ======================
+import numpy as np
 import os
 import uuid
 import logging
 import time
 from io import BytesIO
-from pydantic_settings import BaseSettings
-from typing import Optional, List, Dict, Any
-from pathlib import Path
+from typing import List, Dict, Any
+import pathlib
 
+# ====================== 2. 第三方库导入（pip安装） ======================
+# FastAPI相关（核心Web框架）
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+# Pydantic配置（读取.env）
+from pydantic_settings import BaseSettings
+# PDF处理
+from pypdf import PdfReader
+# 向量数据库
+import chromadb
+# 异步HTTP请求（替代requests）
+import httpx
+# 加载.env文件（关键：补充你缺失的导入）
+from dotenv import load_dotenv
+
+# ====================== 3. 加载环境变量（必须在导入后、逻辑前） ======================
+load_dotenv()  # 自动读取项目根目录的.env文件
+
+# ====================== 4. 初始化核心对象（导入后立即初始化） ======================
 # Configure logging - 优化日志格式
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +43,7 @@ class Settings(BaseSettings):
     chunk_size: int = 500  # 文档分块大小
     chunk_overlap: int = 50  # 分块重叠长度
     max_file_size: int = 10 * 1024 * 1024  # 10MB
+    minimax_embed_model: str = "embo-01"  # 向量化模型，可通过.env覆盖
 
     # 缩进修正：属于Settings的内部类
     class Config:
@@ -56,7 +72,7 @@ app = FastAPI(
 )
 
 # 向量数据库初始化（异步友好）
-DB_DIR = Path("./chroma_db")
+DB_DIR = pathlib.Path("./chroma_db")
 DB_DIR.mkdir(exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=str(DB_DIR))
 
@@ -72,7 +88,7 @@ except Exception as e:
     )
 
 # 上传目录初始化
-UPLOAD_DIR = Path("./uploads")
+UPLOAD_DIR = pathlib.Path("./uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 ALLOWED_EXTENSIONS = {'.pdf', '.txt', '.md'}
 
@@ -102,52 +118,59 @@ def split_text_into_chunks(text: str, chunk_size: int, chunk_overlap: int) -> Li
     logger.info(f"文本分块完成：{len(chunks)}个片段，原长度{len(text)}字符")
     return chunks
 
-async def get_embedding(text: str) -> List[float]:
-    """异步获取文本向量（修复+优化）"""
-    if not text or not text.strip():
-        raise ValueError("文本内容不能为空")
+def get_embedding(text: str) -> List[float]:
+    """
+    获取文本的向量表示
+    """
+    if not text.strip():
+        raise ValueError("输入文本不能为空")
     
-    url = f"https://api.minimax.chat/v1/embeddings?GroupId={GROUP_ID}"
+    api_key = os.getenv("MINIMAX_API_KEY")
+    group_id = os.getenv("MINIMAX_GROUP_ID", "2027260839349723880")
+    
+    if not api_key:
+        raise RuntimeError("未配置 MINIMAX_API_KEY 环境变量")
+    
+    url = f"https://api.minimax.chat/v1/embeddings?GroupId={group_id}"
+    
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
     }
-    
-    # 文本长度检查+日志
-    text_length = len(text)
-    if text_length > 3000:
-        logger.warning(f"文本过长（{text_length}字符），截断至3000字符")
-        truncated_text = text[:3000]
-    else:
-        truncated_text = text
-        logger.info(f"请求向量化，文本长度：{text_length}字符")
-    
+
     payload = {
         "model": "embo-01",
-        "texts": [truncated_text]
+        "texts": [text],
+        "type": "query"
     }
-    
+
+    print(f"请求向量化，文本长度：{len(text)}字符")
     try:
-        response = await async_client.post(url, json=payload, headers=headers)
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(url, headers=headers, json=payload)
         response.raise_for_status()
-        result = response.json()
         
-        # 兼容MiniMax不同返回格式
-        if "vectors" in result and len(result["vectors"]) > 0:
-            return result["vectors"][0]
-        elif "data" in result and len(result["data"]) > 0:
-            return result["data"][0]["embedding"]
-        else:
-            raise ValueError(f"MiniMax返回无向量数据：{result}")
-            
-    except httpx.TimeoutException:
-        raise RuntimeError("向量化请求超时（请检查网络或MiniMax服务状态）")
+        resp_json = response.json()
+        print(f"MiniMax返回: {resp_json}")
+        
+        if resp_json.get("base_resp", {}).get("status_code") != 0:
+            error_msg = resp_json.get("base_resp", {}).get("status_msg", "未知错误")
+            raise RuntimeError(f"MiniMax API返回错误：{error_msg}")
+        
+        embedding = resp_json["vectors"][0]
+        
+        print(f"向量维度: {len(embedding)}")
+        print(f"向量前5个值: {embedding[:5]}")
+        
+        return embedding
+    
     except httpx.HTTPStatusError as e:
-        raise RuntimeError(f"向量化请求失败（{e.response.status_code}）：{e.response.text}")
+        raise RuntimeError(f"HTTP请求失败：{e.response.status_code} {e.response.text}") from e
     except Exception as e:
-        raise RuntimeError(f"向量化失败：{str(e)}")
+        raise RuntimeError(f"向量化失败：{str(e)}") from e
 
 async def chat_with_minimax(question: str, context: str) -> str:
+    logger.info(f"调用 chat_with_minimax，问题：{question[:50]}，上下文长度：{len(context)}")
     """异步调用MiniMax对话接口（修复+优化）"""
     if not question or not context:
         return "错误：问题或上下文不能为空"
@@ -193,6 +216,7 @@ async def chat_with_minimax(question: str, context: str) -> str:
         response = await async_client.post(url, json=payload, headers=headers)
         response.raise_for_status()
         result = response.json()
+        logger.info(f"模型返回结果：{result}")
         
         # 兼容不同返回格式
         if "reply" in result:
@@ -217,12 +241,12 @@ async def chat_with_minimax(question: str, context: str) -> str:
 
 def validate_file(filename: str) -> bool:
     """验证文件类型"""
-    ext = Path(filename).suffix.lower()
+    ext = pathlib.Path(filename).suffix.lower()
     return ext in ALLOWED_EXTENSIONS
 
 def extract_text_from_file(content: bytes, filename: str) -> str:
     """提取文件文本（支持多编码+PDF）"""
-    ext = Path(filename).suffix.lower()
+    ext = pathlib.Path(filename).suffix.lower()
     text = ""
     
     try:
@@ -306,7 +330,7 @@ async def upload_file(file: UploadFile = File(..., description="支持PDF/TXT/MD
         upload_time = time.strftime("%Y-%m-%d %H:%M:%S")
         
         # 保存原始文件
-        file_save_path = UPLOAD_DIR / f"{base_doc_id}_{Path(file.filename).name}"
+        file_save_path = UPLOAD_DIR / f"{base_doc_id}_{pathlib.Path(file.filename).name}"
         with open(file_save_path, "wb") as f:
             f.write(contents)
         logger.info(f"原始文件保存至：{file_save_path}")
@@ -314,7 +338,7 @@ async def upload_file(file: UploadFile = File(..., description="支持PDF/TXT/MD
         # 逐个处理分块
         for chunk_idx, chunk in enumerate(chunks):
             # 生成向量
-            emb = await get_embedding(chunk)
+            emb = get_embedding(chunk)  #
             
             # 生成唯一ID（基础ID+分块序号）
             chunk_id = f"{base_doc_id}_chunk_{chunk_idx}"
@@ -372,7 +396,7 @@ async def ask_question(
         logger.info(f"处理问答请求：{q[:50]}... (top_k={top_k})")
         
         # 1. 问题向量化
-        q_emb = await get_embedding(q)
+        q_emb =  get_embedding(q)
         
         # 2. 查询相似文档
         results = collection.query(
@@ -503,7 +527,7 @@ async def delete_document(doc_id: str, delete_all_chunks: bool = True):
             # 删除原始文件（如果存在）
             for meta in results["metadatas"]:
                 if meta.get("base_doc_id") == doc_id and "file_path" in meta:
-                    file_path = Path(meta["file_path"])
+                    file_path = pathlib.Path(meta["file_path"])
                     if file_path.exists():
                         file_path.unlink()
                         logger.info(f"删除原始文件：{file_path}")
@@ -547,6 +571,7 @@ async def health_check():
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "config": {
             "minimax_group_id": GROUP_ID[:10] + "..." if GROUP_ID else "未配置",
+            "minimax_embed_model": settings.minimax_embed_model,
             "chunk_size": settings.chunk_size,
             "max_file_size_mb": settings.max_file_size / 1024 / 1024
         },

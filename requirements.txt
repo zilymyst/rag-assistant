@@ -1,6 +1,9 @@
 fastapi
 uvicorn
 pydantic>=2
+pydantic-settings 
 pypdf
-chromadb
+chromadb==0.4.24  # 固定稳定版本
 requests
+numpy<2.0
+python-multipart  # 新增：支持文件上传

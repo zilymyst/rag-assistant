@@ -1,0 +1,12 @@
+# 测试和上传文件
+test.txt
+uploads/
+
+# 环境变量
+.env
+
+# Python 缓存
+__pycache__/
+
+# 本地数据库
+chroma_db/
