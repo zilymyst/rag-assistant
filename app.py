@@ -1,4 +1,5 @@
 # ====================== 1. 标准库导入（Python自带） ======================
+from fastapi.staticfiles import StaticFiles
 import numpy as np
 import os
 import uuid
@@ -70,7 +71,13 @@ app = FastAPI(
     description="基于MiniMax的RAG文档问答系统",
     version="1.0.0"
 )
+# 挂载静态文件目录
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
+@app.get("/")
+async def read_root():
+    from fastapi.responses import FileResponse
+    return FileResponse("static/index.html")
 # 向量数据库初始化（异步友好）
 DB_DIR = pathlib.Path("./chroma_db")
 DB_DIR.mkdir(exist_ok=True)
