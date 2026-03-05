@@ -170,26 +170,29 @@ def get_embedding(text: str) -> List[float]:
         raise RuntimeError(f"向量化失败：{str(e)}") from e
 
 async def chat_with_minimax(question: str, context: str) -> str:
+    """异步调用MiniMax对话接口（适配官方标准返回格式）"""
     logger.info(f"调用 chat_with_minimax，问题：{question[:50]}，上下文长度：{len(context)}")
-    """异步调用MiniMax对话接口（修复+优化）"""
+    
+    # 入参校验
     if not question or not context:
         return "错误：问题或上下文不能为空"
     
-    url = f"https://api.minimax.chat/v1/text/chatcompletion?GroupId={GROUP_ID}"
+    # 接口配置
+    url = f"https://api.minimax.chat/v1/chat/completions?GroupId={GROUP_ID}"
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
     }
     
-    # 上下文长度检查+日志
+    # 上下文长度控制（避免超限）
     context_length = len(context)
     if context_length > 5000:
         logger.warning(f"上下文过长（{context_length}字符），截断至5000字符")
         truncated_context = context[:5000]
     else:
         truncated_context = context
-        logger.info(f"请求对话生成，上下文长度：{context_length}字符")
     
+    # 构造请求消息体
     messages = [
         {
             "role": "system",
@@ -205,40 +208,54 @@ async def chat_with_minimax(question: str, context: str) -> str:
     ]
     
     payload = {
-        "model": "abab6.5s-chat",
-        "messages": messages,
-        "tokens_to_generate": 1000,
-        "temperature": 0.3,
-        "top_p": 0.9
+    "model": "MiniMax-M2.5",
+    "messages": messages,
+    "max_tokens": 1000,  # 新参数名
+    "temperature": 0.3,
+    "top_p": 0.9
+    # 注意：新版接口可能不需要 GroupId 放在 URL，但保留无妨
     }
     
     try:
+        # 发送异步请求
         response = await async_client.post(url, json=payload, headers=headers)
         response.raise_for_status()
         result = response.json()
-        logger.info(f"模型返回结果：{result}")
+        logger.info(f"模型完整返回结果：{result}")
         
-        # 兼容不同返回格式
-        if "reply" in result:
-            return result["reply"].strip()
-        elif "choices" in result and len(result["choices"]) > 0:
-            return result["choices"][0]["message"]["content"].strip()
-        elif "text" in result:
-            return result["text"].strip()
+        # 优先适配MiniMax官方标准格式（OpenAI兼容版）
+        answer = ""
+        if isinstance(result, dict):
+            # 核心：提取官方标准格式的回答内容
+            choices = result.get("choices", [])
+            if choices and isinstance(choices, list):
+                first_choice = choices[0]
+                if isinstance(first_choice, dict):
+                    message = first_choice.get("message", {})
+                    answer = message.get("content", "").strip()
+            
+            # 兼容旧版reply格式（备用）
+            if not answer:
+                answer = result.get("reply", "").strip() or result.get("text", "").strip()
+        
+        # 结果校验
+        if answer:
+            return answer
         else:
-            logger.error(f"未知的返回格式：{result}")
-            return "无法解析模型返回结果，请检查日志"
+            logger.error(f"未提取到有效回答，返回结构：{result}")
+            return "未获取到有效回答，请检查接口返回格式"
             
     except httpx.TimeoutException:
         logger.error("对话请求超时")
         return "生成答案超时，请稍后重试"
     except httpx.HTTPStatusError as e:
-        logger.error(f"对话请求失败（{e.response.status_code}）：{e.response.text}")
-        return f"生成答案失败（接口错误：{e.response.status_code}）"
+        error_detail = e.response.text[:200]
+        logger.error(f"对话请求失败（{e.response.status_code}）：{error_detail}")
+        return f"生成答案失败（接口错误：{e.response.status_code}）：{error_detail}"
     except Exception as e:
-        logger.error(f"对话接口异常：{str(e)}")
-        return f"生成答案失败（系统错误）：{str(e)[:100]}..."
-
+        error_msg = str(e)[:100]
+        logger.error(f"对话接口异常：{error_msg}...", exc_info=True)
+        return f"生成答案失败（系统错误）：{error_msg}..."
 def validate_file(filename: str) -> bool:
     """验证文件类型"""
     ext = pathlib.Path(filename).suffix.lower()
